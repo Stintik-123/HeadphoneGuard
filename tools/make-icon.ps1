@@ -60,11 +60,12 @@ function New-BmpImage([int]$size) {
 
     # BITMAPINFOHEADER (биHeight = 2 * height из-за XOR + AND)
     $header = New-Object byte[] 40
-    [Array]::Copy([System.BitConverter]::GetBytes([int]$size), 0, $header, 0, 4)   # biWidth
-    [Array]::Copy([System.BitConverter]::GetBytes([int]($size * 2)), 0, $header, 4, 4) # biHeight
-    [Array]::Copy([System.BitConverter]::GetBytes([int]1), 0, $header, 8, 4)         # biPlanes
-    [Array]::Copy([System.BitConverter]::GetBytes([int]32), 0, $header, 12, 4)       # biBitCount
-    [Array]::Copy([System.BitConverter]::GetBytes([int]0), 0, $header, 16, 4)        # biCompression
+    [Array]::Copy([System.BitConverter]::GetBytes([int]40), 0, $header, 0, 4)                     # biSize
+    [Array]::Copy([System.BitConverter]::GetBytes([int]$size), 0, $header, 4, 4)                   # biWidth
+    [Array]::Copy([System.BitConverter]::GetBytes([int]($size * 2)), 0, $header, 8, 4)            # biHeight
+    [Array]::Copy([System.BitConverter]::GetBytes([int16]1), 0, $header, 12, 2)                  # biPlanes
+    [Array]::Copy([System.BitConverter]::GetBytes([int16]32), 0, $header, 14, 2)                 # biBitCount
+    [Array]::Copy([System.BitConverter]::GetBytes([int]0), 0, $header, 16, 4)                     # biCompression
     [Array]::Copy([System.BitConverter]::GetBytes([int]($xor.Length + $and.Length)), 0, $header, 20, 4)
 
     $dib = New-Object byte[] (40 + $xor.Length + $and.Length)

@@ -15,6 +15,15 @@ public sealed class Settings
     /// <summary>Максимальная длительность «короткого» звука, мс. Всё длиннее — считается игрой/музыкой.</summary>
     public int ShortSoundMaxMs { get; set; } = 4000;
 
+    /// <summary>Сколько минут после падения заряда действует тихий режим.</summary>
+    public int QuietModeMinutes { get; set; } = 30;
+
+    /// <summary>Как далеко назад искать одиночное оповещение, секунд.</summary>
+    public int LookbackSeconds { get; set; } = 180;
+
+    /// <summary>Пауза без звуков от процесса, после которой его звук считается одиночным оповещением.</summary>
+    public int QuietGapSeconds { get; set; } = 30;
+
     /// <summary>Процессы, которые никогда не заглушать (например, облачный клиент игры).</summary>
     public List<string> ProtectedProcesses { get; set; } = new();
 

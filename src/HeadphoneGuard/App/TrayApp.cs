@@ -44,7 +44,7 @@ public sealed class TrayApp
             });
         };
 
-        _tray.TrayMouseDoubleClick += (_, _) => _ = _engine.PollBatteryAsync();
+        _tray.TrayMouseDoubleClick += (_, _) => _ = _engine.PollAsync();
 
         app.Run();
     }
@@ -78,21 +78,58 @@ public sealed class TrayApp
         var status = new MenuItem { Header = "Статус: " + (_lastStatus ?? "ожидание…"), IsEnabled = false };
         menu.Items.Add(status);
 
+        var quiet = new MenuItem
+        {
+            Header = _engine.QuietModeActive ? "Тихий режим: включён" : "Тихий режим: выключен",
+            IsEnabled = false,
+        };
+        menu.Items.Add(quiet);
+
+        var devices = new MenuItem { Header = "Устройства" };
+        if (_engine.Devices.Count == 0)
+            devices.Items.Add(new MenuItem { Header = "заряд пока неизвестен", IsEnabled = false });
+        foreach (var (name, percent) in _engine.Devices.OrderBy(d => d.Value))
+        {
+            devices.Items.Add(new MenuItem
+            {
+                Header = $"{name}: {percent}%",
+                IsEnabled = false,
+            });
+        }
+        menu.Items.Add(devices);
+
         menu.Items.Add(new Separator());
-        menu.Items.Add(new MenuItem { Header = "Проверить заряд сейчас", Command = new RelayCommand(async () => await _engine.PollBatteryAsync()) });
+        menu.Items.Add(new MenuItem { Header = "Проверить заряд сейчас", Command = new RelayCommand(async () => await _engine.PollAsync()) });
 
         var sounds = new MenuItem { Header = "Последние источники звука" };
         foreach (var evt in _engine.Tracker.RecentEvents.Take(8))
-            sounds.Items.Add(new MenuItem
+        {
+            var item = new MenuItem
             {
-                Header = $"{evt.ProcessName} — {evt.Duration.TotalMilliseconds:F0} мс",
-                IsEnabled = false,
-            });
+                Header = $"{evt.ProcessName} — {evt.Duration.TotalMilliseconds:F0} мс" + (evt.IsOneShot ? "  (оповещение)" : string.Empty),
+            };
+
+            if (evt.IsOneShot && !_settings.MutedProcesses.Contains(evt.ProcessName, StringComparer.OrdinalIgnoreCase))
+            {
+                item.Click += (_, _) =>
+                {
+                    _engine.AlwaysMute(evt.ProcessName);
+                    if (_tray is not null)
+                        _tray.ContextMenu = BuildMenu();
+                };
+            }
+            else
+            {
+                item.IsEnabled = false;
+            }
+
+            sounds.Items.Add(item);
+        }
         if (_engine.Tracker.RecentEvents.Count == 0)
             sounds.Items.Add(new MenuItem { Header = "пока ничего не зафиксировано", IsEnabled = false });
         menu.Items.Add(sounds);
 
-        menu.Items.Add(new MenuItem { Header = "Снять всё глушение", Command = new RelayCommand(() => _engine.UnmuteEverything()) });
+        menu.Items.Add(new MenuItem { Header = "Снять всё глушение", Command = new RelayCommand(() => _engine.UnmuteAll()) });
 
         var threshold = new MenuItem { Header = $"Порог заряда: {_settings.BatteryThreshold}%" };
         foreach (int value in new[] { 5, 10, 15, 20, 30 })

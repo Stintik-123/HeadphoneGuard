@@ -21,6 +21,10 @@ public sealed record AudioEndpointInfo(
 /// <summary>
 /// Зафиксированный короткий звук: аудиосессия, которая ненадолго активировалась.
 /// Это и есть «источник неприятного звука».
+///
+/// <see cref="IsOneShot"/> — признак одиночного оповещения: сессия жила недолго и
+/// целиком. Игровые звуки приходят «всплесками» внутри долгоживущей сессии,
+/// поэтому помечаются как не-one-shot и не глушатся.
 /// </summary>
 public sealed record SoundEvent(
     DateTime Timestamp,
@@ -30,23 +34,9 @@ public sealed record SoundEvent(
     int ProcessId,
     string ProcessName,
     TimeSpan Duration,
-    double PeakVolume);
-
-public enum GuardDecision
+    double PeakVolume,
+    bool IsOneShot)
 {
-    /// <summary>Сигнал: уровень заряда упал ниже порога.</summary>
-    LowBattery,
-
-    /// <summary>Заряд восстановился — снимаем глушение.</summary>
-    Recovered,
-
-    /// <summary>Ничего не изменилось.</summary>
-    None
+    public string Describe() =>
+        $"{ProcessName} ({SessionName}) — {Duration.TotalMilliseconds:F0} мс";
 }
-
-public sealed record GuardEvent(
-    GuardDecision Decision,
-    BtDeviceInfo? Device,
-    AudioEndpointInfo? Endpoint,
-    SoundEvent? Culprit,
-    IReadOnlyList<SoundEvent> Candidates);

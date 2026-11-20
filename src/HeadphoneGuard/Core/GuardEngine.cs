@@ -1,29 +1,37 @@
-using System.Diagnostics;
 using HeadphoneGuard.Audio;
-using HeadphoneGuard.Bluetooth;
 
 namespace HeadphoneGuard.Core;
 
 /// <summary>
-/// Главный сценарий: следит за зарядом Bluetooth-устройств, ловит момент, когда
-/// Windows проигрывает «ваш наушник разряжается», определяет, какая именно
-/// аудиосессия издала этот звук, и заглушает только её — звук игры не страдает.
+/// Главный сценарий:
+///   1) следит за зарядом любых беспроводных устройств (PnP, vendor-HID, GATT);
+///   2) ловит момент, когда прозвучало одиночное оповещение (а не игровой звук);
+///   3) глушит именно его — звук игры не страдает;
+///   4) показывает своё уведомление Windows один раз за цикл разряда;
+///   5) снимает глушение, когда заряд восстановился.
+///
+/// Тихий режим включается, пока хоть одно устройство «на дне»: в этом состоянии
+/// любое одиночное оповещение (голос производителя, системный сигнал) заглушается,
+/// а игровые звуки — внутри долгоживущих сессий — остаются нетронутыми.
 /// </summary>
 public sealed class GuardEngine : IDisposable
 {
+    private sealed class DeviceState
+    {
+        public int? LastPercent { get; set; }
+        public bool Notified { get; set; }
+        public DateTime ArmedUntil { get; set; } = DateTime.MinValue;
+    }
+
     private readonly Settings _settings;
     private readonly AudioCatalog _catalog = new();
     private readonly SoundSourceTracker _tracker;
     private readonly ToastService _toast = new();
-    private readonly BluetoothBatteryReader _gattFallback = new();
+    private readonly BatteryService _battery = new();
+    private readonly Dictionary<string, DeviceState> _devices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _mutedSessions = new(StringComparer.OrdinalIgnoreCase);
 
-    private readonly Dictionary<string, int> _lastBattery = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTime> _lastSeen = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _deviceNames = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _mutedThisCycle = new(StringComparer.OrdinalIgnoreCase);
-
-    private Timer? _batteryTimer;
-    private DateTime _armedUntil = DateTime.MinValue;
+    private Timer? _pollTimer;
     private bool _notificationReady;
 
     public event Action<string>? StatusChanged;
@@ -31,23 +39,55 @@ public sealed class GuardEngine : IDisposable
     public GuardEngine(Settings settings)
     {
         _settings = settings;
-        _tracker = new SoundSourceTracker { ShortSoundMaxMs = settings.ShortSoundMaxMs };
+        _tracker = new SoundSourceTracker
+        {
+            ShortSoundMaxMs = settings.ShortSoundMaxMs,
+            QuietGapMs = settings.QuietGapSeconds * 1000,
+        };
         _tracker.SoundDetected += OnSoundDetected;
     }
 
     public SoundSourceTracker Tracker => _tracker;
 
+    public BatteryService Batteries => _battery;
+
     public IReadOnlyList<AudioEndpointInfo> Endpoints => _catalog.ListActiveRenderEndpoints();
+
+    /// <summary>Активен ли тихий режим (есть устройство на низком заряде).</summary>
+    public bool QuietModeActive => _devices.Values.Any(d =>
+        d.LastPercent is { } p && p <= _settings.BatteryThreshold && d.ArmedUntil > DateTime.Now);
+
+    /// <summary>Текущий заряд известных устройств.</summary>
+    public IReadOnlyDictionary<string, int> Devices => _battery.Current;
+
+    /// <summary>Добавить процесс в список «глушить всегда».</summary>
+    public void AlwaysMute(string processName)
+    {
+        if (string.IsNullOrWhiteSpace(processName))
+            return;
+
+        if (!_settings.MutedProcesses.Contains(processName, StringComparer.OrdinalIgnoreCase))
+        {
+            _settings.MutedProcesses.Add(processName);
+            _settings.Save();
+        }
+
+        SetStatus($"Процесс {processName} добавлен в список «глушить всегда».");
+    }
 
     public void Start()
     {
         _notificationReady = _toast.Initialize();
         _tracker.Start();
-        _batteryTimer = new Timer(
-            _ => _ = PollBatteryAsync(),
+        _battery.Start();
+        _battery.BatteryUpdated += OnBatteryUpdated;
+
+        _ = PollAsync();
+        _pollTimer = new Timer(
+            _ => _ = PollAsync(),
             null,
-            0,
-            Math.Max(5000, _settings.BatteryPollSeconds * 1000));
+            TimeSpan.FromSeconds(Math.Max(5, _settings.BatteryPollSeconds)),
+            TimeSpan.FromSeconds(Math.Max(5, _settings.BatteryPollSeconds)));
     }
 
     private void SetStatus(string text)
@@ -58,43 +98,11 @@ public sealed class GuardEngine : IDisposable
 
     // ---------------------------------------------------------------- батарея
 
-    public async Task PollBatteryAsync()
+    public async Task PollAsync()
     {
         try
         {
-            var readings = await ReadBatteryLevels().ConfigureAwait(false);
-            var now = DateTime.Now;
-
-            foreach (var reading in readings)
-            {
-                string key = string.IsNullOrEmpty(reading.Address) ? reading.Name : reading.Address;
-                _deviceNames[key] = reading.Name;
-
-                int? previous = _lastBattery.TryGetValue(key, out var p) ? p : null;
-                DateTime previousSeen = _lastSeen.TryGetValue(key, out var s) ? s : now.AddSeconds(-30);
-                _lastBattery[key] = reading.Percent ?? 0;
-                _lastSeen[key] = now;
-
-                if (reading.Percent is not { } percent)
-                    continue;
-
-                bool wasAbove = previous is null || previous > _settings.BatteryThreshold;
-                bool isBelow = percent <= _settings.BatteryThreshold;
-
-                if (wasAbove && isBelow)
-                {
-                    await HandleLowBatteryAsync(reading, previousSeen, now).ConfigureAwait(false);
-                }
-                else if (previous is not null && previous <= _settings.BatteryThreshold && percent > _settings.BatteryThreshold + 5)
-                {
-                    HandleRecovered(reading);
-                }
-
-                // «Взводим» защиту: если заряд уже почти разряжен, следующий
-                // короткий звук почти наверняка — это оповещение о батарее.
-                if (percent <= _settings.BatteryThreshold + 5)
-                    _armedUntil = now.AddSeconds(120);
-            }
+            await _battery.PollAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -102,117 +110,121 @@ public sealed class GuardEngine : IDisposable
         }
     }
 
-    private sealed record BatteryReading(string Name, string Address, int? Percent, bool Connected);
-
-    private async Task<IReadOnlyList<BatteryReading>> ReadBatteryLevels()
+    private void OnBatteryUpdated(BatteryService.DeviceBattery battery)
     {
-        var result = new List<BatteryReading>();
+        var state = GetState(battery.Name);
+        int? previous = state.LastPercent;
+        state.LastPercent = battery.Percent;
 
-        // 1) Классические Bluetooth-устройства: свойство PnP-дерева.
-        foreach (var node in DeviceTree.ReadBluetoothBatteryNodes())
-        {
-            string name = string.IsNullOrWhiteSpace(node.FriendlyName) ? node.Address : node.FriendlyName;
-            result.Add(new BatteryReading(name, node.Address, node.BatteryPercent, node.Connected ?? true));
-        }
+        bool below = battery.Percent <= _settings.BatteryThreshold;
 
-        // 2) LE-устройства без PnP-батареи: GATT Battery Service.
-        if (result.Count == 0)
+        if (below)
         {
-            foreach (var device in await _gattFallback.ReadAsync().ConfigureAwait(false))
+            // Тихий режим держим, пока устройство на дне.
+            state.ArmedUntil = DateTime.Now.AddMinutes(_settings.QuietModeMinutes);
+
+            if (!state.Notified)
             {
-                if (device.BatteryPercent is { } percent)
-                    result.Add(new BatteryReading(device.Name, device.Address, percent, device.Connected));
+                state.Notified = true;
+                HandleLowBattery(battery.Name, battery.Percent);
             }
         }
+        else if (previous is not null && previous <= _settings.BatteryThreshold &&
+                 battery.Percent > _settings.BatteryThreshold + 5)
+        {
+            HandleRecovered(battery.Name);
+        }
+    }
 
-        return result;
+    private DeviceState GetState(string name)
+    {
+        if (!_devices.TryGetValue(name, out var state))
+        {
+            state = new DeviceState();
+            _devices[name] = state;
+        }
+
+        return state;
     }
 
     // ------------------------------------------------------- срабатывание
 
-    private async Task HandleLowBatteryAsync(BatteryReading reading, DateTime previousSeen, DateTime now)
+    private void HandleLowBattery(string deviceName, int percent)
     {
-        var endpoints = Endpoints;
-        var endpoint = EndpointMatcher.Match(endpoints, reading.Name, _settings.EndpointOverrides);
+        SetStatus($"{deviceName}: заряд {percent}% — сработало.");
 
-        SetStatus($"{reading.Name}: заряд {reading.Percent}% — сработало.");
-
-        // Кандидаты: короткие звуки, прозвучавшие между прошлым и текущим опросом.
+        // Ищем одиночное оповещение, прозвучавшее недавно: обычно именно оно
+        // и есть «голос о разряде».
         var candidates = _tracker.RecentEvents
-            .Where(e => e.Timestamp >= previousSeen.AddSeconds(-3) && e.Timestamp <= now.AddSeconds(5))
-            .Where(e => e.Duration.TotalMilliseconds <= _settings.ShortSoundMaxMs)
+            .Where(e => e.IsOneShot)
+            .Where(e => e.Timestamp >= DateTime.Now.AddSeconds(-_settings.LookbackSeconds))
             .Where(e => !IsProtected(e.ProcessName))
-            .OrderByDescending(e => _settings.MutedProcesses.Any(p =>
-                e.ProcessName.Contains(p, StringComparison.OrdinalIgnoreCase)))
-            .ThenByDescending(e => e.Timestamp)
+            .OrderByDescending(e => e.Timestamp)
             .ToList();
 
         if (candidates.Count > 0)
         {
             var culprit = candidates[0];
-            if (_tracker.MuteSession(culprit.SessionId))
+            if (MuteSession(culprit))
             {
-                _mutedThisCycle.Add(culprit.SessionId);
-                SetStatus($"Заглушён источник «{culprit.ProcessName}».");
                 Notify(
-                    "Наушники разряжаются",
-                    $"Заряд {reading.Percent}%. Заглушён источник: {culprit.ProcessName}.");
+                    "Устройство разряжается",
+                    $"{deviceName}: {percent}%. Заглушён источник: {culprit.ProcessName}.");
                 return;
             }
         }
 
-        // Фолбэк: источник не нашли — гасим сам выход ненадолго.
-        if (endpoint is not null)
-        {
-            MuteEndpointBriefly(endpoint.Id, 8);
-            Notify(
-                "Наушники разряжаются",
-                $"Заряд {reading.Percent}%. Источник звука не определён — приглушён выход «{endpoint.FriendlyName}».");
-            return;
-        }
-
-        Notify("Наушники разряжаются", $"Заряд {reading.Percent}%.");
+        Notify(
+            "Устройство разряжается",
+            $"{deviceName}: {percent}%. Тихий режим включён — оповещения будут заглушены.");
     }
 
-    private void HandleRecovered(BatteryReading reading)
+    private void HandleRecovered(string deviceName)
     {
-        if (_mutedThisCycle.Count == 0)
-            return;
+        bool hadMutes = _mutedSessions.Count > 0;
+        UnmuteAll();
 
-        _tracker.UnmuteAll();
-        _mutedThisCycle.Clear();
-        SetStatus($"{reading.Name}: заряд восстановлен — глушение снято.");
-        Notify("Заряд восстановлен", $"{reading.Name} снова заряжен. Звук возвращён.");
+        var state = GetState(deviceName);
+        state.Notified = false;
+        state.ArmedUntil = DateTime.MinValue;
+
+        if (hadMutes)
+            Notify("Заряд восстановлен", $"{deviceName} снова заряжен. Звук возвращён.");
     }
 
     /// <summary>
-    /// Срабатывает сразу на короткий звук, когда устройство уже «на дне» —
-    /// так мы ловим оповещение Windows даже между опросами заряда.
+    /// Реагирует на короткий звук: глушит одиночные оповещения, пока тихий режим активен.
+    /// Звуки внутри долгоживущих сессий (игра, музыка) не трогаем.
     /// </summary>
     private void OnSoundDetected(SoundEvent evt)
     {
-        if (DateTime.Now > _armedUntil)
-            return;
-
-        if (evt.Duration.TotalMilliseconds > _settings.ShortSoundMaxMs)
+        if (!evt.IsOneShot)
             return;
 
         if (IsProtected(evt.ProcessName))
             return;
 
-        bool known = _settings.MutedProcesses.Any(p =>
+        bool alwaysMute = _settings.MutedProcesses.Any(p =>
+            !string.IsNullOrWhiteSpace(p) &&
             evt.ProcessName.Contains(p, StringComparison.OrdinalIgnoreCase));
 
-        // Известный «нарушитель» глушим всегда, остальных — только когда заряд на исходе.
-        if (!known && DateTime.Now > _armedUntil)
+        if (!alwaysMute && !QuietModeActive)
             return;
 
-        if (_tracker.MuteSession(evt.SessionId))
-        {
-            _mutedThisCycle.Add(evt.SessionId);
-            SetStatus($"Заглушён источник «{evt.ProcessName}» (заряд на исходе).");
-            Notify("Заглушён раздражающий звук", $"Источник: {evt.ProcessName}.");
-        }
+        if (!MuteSession(evt))
+            return;
+
+        SetStatus($"Заглушён источник «{evt.ProcessName}».");
+        Notify("Заглушено оповещение", $"Источник: {evt.ProcessName}.");
+    }
+
+    private bool MuteSession(SoundEvent evt)
+    {
+        if (!_tracker.MuteSession(evt.SessionId))
+            return false;
+
+        _mutedSessions.Add(evt.SessionId);
+        return true;
     }
 
     private bool IsProtected(string processName)
@@ -270,11 +282,16 @@ public sealed class GuardEngine : IDisposable
         }
     }
 
-    public void UnmuteEverything() => _tracker.UnmuteAll();
+    public void UnmuteAll()
+    {
+        _tracker.UnmuteAll();
+        _mutedSessions.Clear();
+    }
 
     public void Dispose()
     {
-        _batteryTimer?.Dispose();
+        _pollTimer?.Dispose();
         _tracker.Dispose();
+        _battery.Dispose();
     }
 }

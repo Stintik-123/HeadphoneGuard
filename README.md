@@ -2,17 +2,17 @@
 
 **Заглушает именно тот звук, который раздражает — и только его.**
 
-Когда Bluetooth-гарнитура садится, Windows (или сервис производителя) проигрывает голосовое
-оповещение «устройство разряжается». Оно идёт через тот же аудио-выход, что и игра или музыка,
-поэтому обычное «выключить звук» бьёт по игре.
+Когда беспроводная гарнитура садится, Windows (или сервис производителя, или сам донгл)
+проигрывает голосовое оповещение «устройство разряжается». Оно идёт через тот же
+аудио-выход, что и игра или музыка, поэтому обычное «выключить звук» бьёт по игре.
 
-HeadphoneGuard делает три вещи:
+HeadphoneGuard:
 
-1. **Следит за зарядом** Bluetooth-устройств.
-2. **Определяет, кто именно издал звук** — по аудиосессиям Windows (процесс + ресурс DLL),
-   а не гасит весь выход целиком.
-3. **Глушит только этот источник** и показывает своё уведомление — один раз за цикл разряда.
-   Когда заряд восстановился, глушение снимается само.
+1. **Читает заряд** беспроводных устройств из трёх независимых источников.
+2. **Определяет, кто именно издал звук** — по аудиосессиям Windows (процесс + ресурс DLL).
+3. **Глушит только этот источник** — игровой звук не страдает.
+4. **Показывает своё уведомление** — один раз за цикл разряда, и снимает глушение,
+   когда заряд восстановился.
 
 Никаких прав администратора, ничего не перехватывает, экран не трогает.
 
@@ -23,93 +23,121 @@ HeadphoneGuard делает три вещи:
 ## Как это работает
 
 ```
-  ┌────────────────────┐        ┌──────────────────────────┐        ┌───────────────────┐
-  │ Заряд BT-устройства│───────▶│ Порог (по умолчанию 10%) │───────▶│ Уведомление + mute│
-  │  (PnP / GATT 0x180F)│        └──────────────────────────┘        └───────────────────┘
-  └────────────────────┘                                                   │
-                                                                              ▼
-  ┌────────────────────┐        ┌──────────────────────────┐        ┌───────────────────┐
-  │ Все render-выходы  │───────▶│ Пиковые счётчики сессий  │───────▶│ Mute конкретной   │
-  │ (IAudioSessionMgr2)│        │ «всплески» ≤ 4 с        │        │ аудиосессии       │
-  └────────────────────┘        └──────────────────────────┘        └───────────────────┘
+  ┌─────────────────────────────┐      ┌──────────────────────────────┐
+  │ Источники заряда:           │      │ Порог (по умолчанию 10%)     │
+  │ • PnP-реестр (BTHENUM)      │─────▶│ тихий режим на 30 минут      │
+  │ • vendor-HID (MCHOSE и др.) │      └──────────────┬───────────────┘
+  │ • GATT Battery Service      │                     │
+  └─────────────────────────────┘                     ▼
+                                        ┌──────────────────────────────┐
+  ┌─────────────────────────────┐      │ 1) своё уведомление Windows  │
+  │ Все render-выходы, все     │─────▶│ 2) mute конкретной сессии   │
+  │ аудиосессии + пиковые счётчики│      └──────────────────────────────┘
+  └─────────────────────────────┘
 ```
 
-1. **Заряд.** Для классических Bluetooth-гарнитур (BR/EDR) Windows хранит заряд в свойстве
-   `DEVPKEY_Bluetooth_BatteryLevel` — ровно то значение, что показывает «Параметры → Bluetooth».
-   Мы обходим дерево устройств (`cfgmgr32`) и читаем это свойство. Если гарнитура — Low Energy
-   и PnP-заряда нет, используется GATT Battery Service (`0x180F` / `0x2A19`).
-2. **Источник звука.** Фоновый поток перечисляет аудиосессии каждого выхода, снимает пиковый
-   уровень и делит звук на «всплески». Короткий всплеск — это системный сигнал или реплика
-   приложения; длинный — игра или музыка. Такой же подход использует open-source проект
-   [windows_sound_tracker](https://github.com/IronAdamant/windows_sound_tracker).
-3. **Глушение.** Когда заряд пересёк порог, программа смотрит, какой короткий звук прозвучал
-   в этот момент, и ставит `Mute` именно этой сессии (`ISimpleAudioVolume`). Звук игры не
-   трогается: он живёт в другой сессии и остаётся слышным.
-4. **Уведомление.** Показывается свой тост Windows (AppUserModelID регистрируется в
-   `HKCU\Software\Classes\AppUserModelId` — без прав администратора).
+### 1. Где берётся заряд
+
+| Источник | Что покрывает | Как читается |
+|---|---|---|
+| **Реестр Windows** (`SYSTEM\CurrentControlSet\Enum\BTHENUM`) | классические Bluetooth-гарнитуры (BR/EDR) — именно то, что видно в «Параметры → Bluetooth» | `DEVPKEY_Bluetooth_BatteryLevel` |
+| **vendor-HID** | гарнитуры и мыши с собственным протоколом: MCHOSE, Logitech, Razer, HyperX, Corsair… | кадр `55 65 <значение> 02` на вендорной usage page |
+| **GATT Battery Service** | Low Energy-устройства | `0x180F` / `0x2A19` через WinRT |
+
+Windows показывает заряд далеко не для всех устройств. Например, у MCHOSE V9 PRO
+(донгл `VID_291D&PID_385D`) Windows **не знает** про заряд — зато донгл сам присылает
+кадр по usage page `0xFF90`:
+
+```
+55 65 0A 02 00 00 ...     →  значение 0x0A = 10 %, поле 0x02 = заряд
+```
+
+HeadphoneGuard читает такие кадры напрямую через HID. Проверено на живом устройстве:
+`MCHOSE V9 PRO — 10 %`.
+
+### 2. Как отличить оповещение от игры
+
+Звук считается **оповещением (one-shot)**, если выполняется хотя бы одно условие:
+
+- аудиосессия прожила недолго целиком (это не игровая сессия);
+- процесс молчал дольше `quietGapSeconds` (30 с) — то есть звук пришёл «откуда-то»;
+- сессия активировалась после простоя (типичный признак пришедшего уведомления).
+
+И при этом процесс **не является доминирующим** на этом выходе — то есть непрерывно
+играющим (игра, музыка, видео). Так игровой звук не трогается, а одиночный сигнал
+производителя гасится.
+
+### 3. Как глушится
+
+Глушится **аудиосессия**, а не выход: `ISimpleAudioVolume::SetMute` на конкретной
+сессии. Игра живёт в другой сессии и остаётся слышной.
+
+---
 
 ## Что именно он умеет находить
 
 | Источник | Как определяется |
 |---|---|
-| Голосовое оповещение производителя гарнитуры | процесс-владелец сессии (например, `Soundcore`, `AnkerSound`) |
+| Голос производителя гарнитуры | процесс-владелец сессии (например, `MCHOSE HUB`) |
 | Системный звук Windows | `Системные звуки Windows (@%SystemRoot%\System32\AudioSrv.Dll,-202)` — ресурс указывается прямо в имени сессии |
 | Любое другое короткое приложение | имя процесса + длительность всплеска + пиковый уровень |
 
-Честное ограничение: **Windows не отдаёт путь к самому `.wav`-файлу** через публичный API.
-Источник определяется на уровне приложения/ресурса DLL — этого достаточно, чтобы заглушить
-именно его, не трогая остальной звук.
+Честное ограничение: **Windows не отдаёт путь к самому `.wav`-файлу** через публичный
+API. Источник определяется на уровне приложения/ресурса DLL — этого достаточно, чтобы
+заглушить именно его, не трогая остальной звук.
 
 ## Возможности
 
-- Тихий режим: уведомление один раз за цикл разряда, никакого повторного писка.
+- Тихий режим: уведомление один раз за цикл разряда, повторные оповещения глушатся.
 - Глушение строго по источнику: игровой звук продолжает играть.
-- Автоснятие глушения, когда заряд восстановился.
-- Ручной список «нарушителей»: процессы, которые глушатся всегда, когда бы они ни пискнули.
-- Защищённые процессы: например, облачный клиент игры можно внести в «не трогать».
-- Порог заряда настраивается из трея (5 / 10 / 15 / 20 / 30 %).
-- Трей-иконка с меню: текущий статус, последние источники звука, снять глушение, автозапуск.
-- Диагностический режим `--diagnose` — показывает заряды, выходы и живые аудиосессии.
+- Автоснятие глушения, когда заряд восстановился (+10 % сверх порога).
+- Список «нарушителей»: процессы, которые глушатся всегда — в том числе по клику
+  в трее по последнему зафиксированному источнику.
+- Список «не трогать»: клиент облачной игры, Discord и прочее.
+- Трей-меню: статус, список устройств с зарядом, последние источники звука, порог,
+  автозапуск, журнал.
+- Диагностические режимы `--diagnose`, `--hid`, `--sessions`.
+- Журнал: `%APPDATA%\HeadphoneGuard\headphoneguard.log`.
 
 ## Установка
 
 Требуется Windows 10 2004+ / Windows 11 и .NET 8 Desktop Runtime.
 
 ```powershell
-git clone https://github.com/<ваш-логин>/HeadphoneGuard.git
+git clone https://github.com/Stintik-123/HeadphoneGuard.git
 cd HeadphoneGuard
-dotnet publish src/HeadphoneGuard/HeadphoneGuard.csproj -c Release -r win-x64 --self-contained false
+dotnet publish src/HeadphoneGuard/HeadphoneGuard.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
 ```
 
 Запустите `HeadphoneGuard.exe` — появится иконка в трее. Правый клик по иконке:
 «Запускать вместе с Windows», порог заряда, список последних источников звука.
 
 Ничего не устанавливается в систему: настройки лежат в
-`%APPDATA%\HeadphoneGuard\settings.json`, AppUserModelID — в ветке реестра текущего пользователя.
+`%APPDATA%\HeadphoneGuard\settings.json`, AppUserModelID — в ветке реестра текущего
+пользователя.
 
 ## Использование из командной строки
 
 ```text
-HeadphoneGuard                запустить в фоне (иконка в трее)
-HeadphoneGuard --diagnose     показать заряды, выходы и активные сессии
+HeadphoneGuard                запуск в фоне (иконка в трее)
+HeadphoneGuard --diagnose     заряды, выходы и живые аудиосессии
 HeadphoneGuard --diagnose --seconds 10 --beep
                               10 секунд следить за звуками, в начале проиграть
-                              системный звук — чтобы проверить детектор
+                              системный звук — проверка детектора
+HeadphoneGuard --hid          HID-коллекции, вендорные кадры и попытки опроса заряда
+HeadphoneGuard --sessions     состояния сессий и пиковые уровни (отладка)
 HeadphoneGuard --verbose      подробный лог
 ```
 
 Пример вывода `--diagnose`:
 
 ```text
-=== Bluetooth-устройства с зарядом (PnP-дерево) ===
-  WH-1000XM4 [00:1A:7D:DA:71:1B] — 8% (подключено: True)
+=== Заряд беспроводных устройств (универсальный источник) ===
+  MCHOSE V9 PRO — 10% (источник: HID)
 
 === Аудио-выходы (render) ===
-  Наушники (WH-1000XM4 Stereo)
-      id: {0.0.0.00000000}.{7a3c...}
-
-=== Живые аудиосессии (кто сейчас играет) ===
-  21:04:12 Системные звуки Windows (@%SystemRoot%\System32\AudioSrv.Dll,-202) — 1197 мс
+  Динамики (MCHOSE V9 PRO)
+      id: {0.0.0.00000000}.{72c363a0-e701-4132-b939-c2299f9ff7fb}
 ```
 
 ## Настройки
@@ -120,42 +148,62 @@ HeadphoneGuard --verbose      подробный лог
 |---|---|---|
 | `batteryThreshold` | `10` | Процент, ниже которого считается «скоро разрядится» |
 | `batteryPollSeconds` | `30` | Как часто опрашивать заряд |
+| `quietModeMinutes` | `30` | Сколько после падения заряда действует тихий режим |
 | `shortSoundMaxMs` | `4000` | Всё длиннее — считается игрой/музыкой и не глушится |
-| `protectedProcesses` | `[]` | Процессы, которые никогда не заглушать (например, клиент облачной игры) |
+| `quietGapSeconds` | `30` | Пауза без звуков от процесса, после которой его звук считается оповещением |
+| `lookbackSeconds` | `180` | Как далеко назад искать оповещение, прозвучавшее при падении заряда |
+| `protectedProcesses` | `[]` | Процессы, которые никогда не заглушать |
 | `mutedProcesses` | `[]` | Процессы, которые глушатся всегда |
-| `endpointOverrides` | `{}` | Ручная привязка Bluetooth-устройства к аудио-выходу |
+| `endpointOverrides` | `{}` | Ручная привязка устройства к аудио-выходу |
 | `showNotification` | `true` | Показывать тост Windows |
+
+## Поддерживаемые устройства
+
+| Семейство | Как читается заряд | Статус |
+|---|---|---|
+| **MCHOSE V9 PRO** (донгл `VID_291D&PID_385D`) | vendor-HID, usage page `0xFF90`, кадр `55 65 <заряд> 02` | ✅ проверено на живом устройстве |
+| MCHOSE X9 / V9 Pro 2 | тот же вендорный протокол (`0xFF90`, `0xFF07:0222`) | ✅ по открытым протоколам |
+| Bluetooth-гарнитуры (BR/EDR) | PnP-реестр, `DEVPKEY_Bluetooth_BatteryLevel` | ✅ |
+| Bluetooth LE (наушники, мыши) | GATT Battery Service `0x180F` | ✅ |
+| Logitech / Razer / HyperX / Corsair и другие 2.4 ГГц | vendor-HID (формат `55 65 …`) | ⚠️ протоколы разные, читается не у всех |
 
 ## Ограничения
 
-- Гарнитура должна **сама отдавать заряд** в Windows. Некоторые дешёвые TWS этого не делают —
-  тогда порог не сработает, но заглушить источник вручную (или добавить процесс в
-  `mutedProcesses`) можно всегда.
-- Заряд в PnP публикуется на узле `BTHENUM` сервиса (Hands-Free), а не на самом устройстве —
-  поэтому обходятся все узлы дерева, а не только класс Bluetooth.
-- Если оповещение проигрывает сам Windows, а не сервис производителя, источником будет
-  «Системные звуки Windows» — их глушение отключает все системные звуки до восстановления заряда.
-- Имя Bluetooth-устройства сопоставляется с аудио-выходом по совпадению значимых токенов;
+- Устройство должно **само отдавать заряд**. Если нет — порог не сработает, но процесс
+  можно добавить в `mutedProcesses`, и он будет глушиться всегда.
+- Если оповещение проигрывает сам Windows, источником будет «Системные звуки Windows» —
+  их глушение отключает все системные звуки до восстановления заряда.
+- Имя устройства сопоставляется с аудио-выходом по совпадению значимых токенов;
   при неоднозначности задайте привязку вручную в `endpointOverrides`.
+- Донглы с vendor-HID отвечают на запрос кадра не сразу: значение заряда обновляется
+  событийно, поэтому в трее может на секунды отставать.
 
 ## Архитектура
 
 ```text
 src/HeadphoneGuard/
 ├── Bluetooth/
-│   ├── DeviceTree.cs             чтение PnP-свойств (cfgmgr32): заряд, адрес, имя
-│   └── BluetoothBatteryReader.cs  fallback: GATT Battery Service через WinRT
+│   ├── RegistryBatteryReader.cs  заряд BT-гарнитур из реестра (BTHENUM)
+│   ├── BluetoothBatteryReader.cs  fallback: GATT Battery Service через WinRT
+│   ├── DeviceNames.cs             VID/PID -> человеческое имя устройства
+│   └── DeviceTree.cs              свойства дерева устройств (SetupAPI)
+├── Hid/
+│   ├── HidInspector.cs            перечисление HID-коллекций, обмен по отчётам
+│   ├── HidListener.cs             фоновое чтение input-отчётов
+│   ├── HidBatteryMonitor.cs       заряд из вендорных HID-протоколов
+│   └── MchoseBatteryProtocol.cs   форматы кадров заряда
 ├── Audio/
 │   ├── AudioCatalog.cs            список render-выходов и их свойства
-│   ├── SoundSourceTracker.cs     слежение за сессиями, «всплески», mute/unmute
-│   └── EndpointMatcher.cs         сопоставление BT-устройства и выхода
+│   ├── SoundSourceTracker.cs      слежение за сессиями, «всплески», mute/unmute
+│   └── EndpointMatcher.cs         сопоставление устройства и выхода
 ├── Core/
 │   ├── GuardEngine.cs             сценарий: заряд → звук → mute → уведомление
+│   ├── BatteryService.cs          единый источник заряда
 │   ├── ToastService.cs            тосты Windows + регистрация AUMID
 │   ├── Settings.cs                настройки в JSON
 │   └── Autostart.cs               автозапуск (HKCU\...\Run)
 ├── App/TrayApp.cs                 иконка в трее и меню
-└── Program.cs                     CLI: --diagnose / --verbose
+└── Program.cs                     CLI: --diagnose / --hid / --sessions
 ```
 
 Сборка иконок: `tools/make-icon.ps1` (классический BMP-ICO, без внешних зависимостей).
@@ -166,13 +214,15 @@ src/HeadphoneGuard/
 
 - [windows_sound_tracker](https://github.com/IronAdamant/windows_sound_tracker) — определение
   источника звука через аудиосессии и пиковые счётчики.
-- [taskbar-battery](https://github.com/renanleonel/windows-taskbar-battery) и
-  [fastfetch](https://github.com/fastfetch-cli/fastfetch) — чтение заряда Bluetooth через
-  `DEVPKEY_Bluetooth_BatteryLevel` в дереве устройств.
+- [Wireless-Device-Battery-Monitor](https://github.com/krisgfx9/wireless-device-battery-monitor)
+  и [taskbar-battery](https://github.com/renanleonel/windows-taskbar-battery) — чтение заряда
+  Bluetooth и устройств с vendor-HID.
+- [HeadsetControl PR #563](https://github.com/Sapd/HeadsetControl/pull/563) — протокол MCHOSE
+  X9 (`usage page 0xFF90`, кадр `55 65 <значение> <поле>`).
 - [BluetoothBatteryMonitor](https://github.com/Kaandonmez/BluetoothBatteryMonitor) — обзор
   протоколов заряда (BLE GATT, HFP/PnP, HID).
 - [audio-auto-mute-Python](https://github.com/farmanullah1/audio-auto-mute-Python) — идея
-  автоматического приглушения выхода при разряде наушников.
+  автоматического приглушения при разряде наушников.
 
 ## Лицензия
 
@@ -182,17 +232,18 @@ MIT — см. [LICENSE](LICENSE).
 
 ## English summary
 
-HeadphoneGuard silences the annoying "your device is low on battery" voice that Windows or a
-headset vendor plays when your Bluetooth headphones run out of charge — without touching the
-game's audio.
+HeadphoneGuard silences the annoying "your device is low on battery" voice that Windows, a
+vendor hub app or the dongle itself plays when your wireless headphones run out of charge —
+without touching the game's audio.
 
-- Reads the headset battery from the Windows device tree (`DEVPKEY_Bluetooth_BatteryLevel`),
-  with a Bluetooth LE GATT Battery Service (`0x180F`) fallback.
+- Reads battery level from three independent sources: the Windows registry (BTHENUM /
+  `DEVPKEY_Bluetooth_BatteryLevel`), vendor HID protocols (MCHOSE, Logitech, Razer…) and
+  Bluetooth LE GATT Battery Service (`0x180F`). Verified live on a MCHOSE V9 PRO dongle.
 - Tracks every audio session of every output device (IAudioSessionManager2 + peak meters) to
   identify **which application** produced the sound, then mutes only that session.
-- Shows a single Windows toast per discharge cycle and restores audio when the battery recovers.
+- One Windows toast per discharge cycle; audio is restored when the battery recovers.
 - No admin rights, no screen capture, no global mute.
 
 Limitations: Windows does not expose the actual `.wav` path, so the source is identified at the
-application/DLL-resource level. Headsets that never report their battery to Windows cannot
-trigger the threshold automatically.
+application/DLL-resource level. Devices that never report their battery cannot trigger the
+threshold automatically.

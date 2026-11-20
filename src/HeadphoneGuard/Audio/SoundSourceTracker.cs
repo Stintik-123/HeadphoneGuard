@@ -23,14 +23,22 @@ public sealed class SoundSourceTracker : IDisposable
     {
         public required AudioSessionControl Control { get; init; }
         public required string EndpointName { get; init; }
+        public DateTime FirstSeenAt { get; init; } = DateTime.Now;
         public DateTime? OnsetAt { get; set; }
         public DateTime? QuietAt { get; set; }
         public double Peak { get; set; }
         public bool IsActive { get; set; }
+
+        /// <summary>Сессия была неактивна и только что активировалась — похоже на оповещение.</summary>
+        public bool ActivatedAfterIdle { get; set; }
+        public DateTime LastInactiveAt { get; set; } = DateTime.Now;
+        public DateTime ActiveSince { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, TrackedSession> _sessions = new();
     private readonly List<SoundEvent> _events = new();
+    private readonly Dictionary<string, DateTime> _lastSoundAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, uint> _dominantProcess = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _eventsGate = new();
     private readonly Dictionary<string, AudioSessionControl> _mutedSessions = new();
     private readonly object _mutedGate = new();
@@ -41,6 +49,19 @@ public sealed class SoundSourceTracker : IDisposable
 
     private Timer? _timer;
     private int _shortSoundMaxMs = 4000;
+    private int _quietGapMs = 30_000;
+    private DateTime _lastErrorAt = DateTime.MinValue;
+    private DateTime _lastHeartbeat = DateTime.MinValue;
+
+    /// <summary>
+    /// Пауза без звуков от процесса, после которой его звук считается одиночным
+    /// оповещением, а не частью ongoing-аудио (игры, музыки).
+    /// </summary>
+    public int QuietGapMs
+    {
+        get => _quietGapMs;
+        set => _quietGapMs = Math.Max(1000, value);
+    }
 
     public event Action<SoundEvent>? SoundDetected;
 
@@ -106,20 +127,33 @@ public sealed class SoundSourceTracker : IDisposable
     {
         try
         {
+            int active = 0;
             for (int e = 0; e < _managers.Count; e++)
-                PollEndpoint(_managers[e], _endpointNames[e]);
+                active += PollEndpoint(_managers[e], _endpointNames[e]);
+
+            if (DateTime.Now - _lastHeartbeat > TimeSpan.FromSeconds(5))
+            {
+                _lastHeartbeat = DateTime.Now;
+                Diagnostics.Dev($"Опрос сессий: активных {active}, всего событий {RecentEvents.Count}");
+            }
         }
         catch (Exception ex)
         {
-            Diagnostics.Dev($"Ошибка опроса сессий: {ex.Message}");
+            // Не даём exception'у спамить лог: пишем раз в 10 секунд.
+            if (DateTime.Now - _lastErrorAt > TimeSpan.FromSeconds(10))
+            {
+                _lastErrorAt = DateTime.Now;
+                Diagnostics.Log($"Ошибка опроса сессий: {ex.Message}");
+            }
         }
     }
 
-    private void PollEndpoint(AudioSessionManager manager, string endpointName)
+    private int PollEndpoint(AudioSessionManager manager, string endpointName)
     {
         manager.RefreshSessions();
 
         var sessions = manager.Sessions;
+        int activeCount = 0;
         for (int i = 0; i < sessions.Count; i++)
         {
             var session = sessions[i];
@@ -145,12 +179,28 @@ public sealed class SoundSourceTracker : IDisposable
 
             if (!active)
             {
+                if (tracked.IsActive)
+                    tracked.LastInactiveAt = DateTime.Now;
+
                 tracked.IsActive = false;
                 Flush(tracked, endpointName);
                 continue;
             }
 
+            if (!tracked.IsActive)
+            {
+                // Сессия только что активировалась после простоя.
+                if ((DateTime.Now - tracked.LastInactiveAt).TotalMilliseconds >= 500)
+                    tracked.ActivatedAfterIdle = true;
+
+                tracked.ActiveSince = DateTime.Now;
+            }
+
             tracked.IsActive = true;
+
+            // Кто непрерывно играет на этом выходе — считается «фоновым» (игра, музыка).
+            if ((DateTime.Now - tracked.ActiveSince).TotalMilliseconds > 3000)
+                _dominantProcess[endpointName] = GetProcessId(tracked.Control);
 
             if (peak >= OnsetThreshold)
             {
@@ -177,7 +227,12 @@ public sealed class SoundSourceTracker : IDisposable
                 else if (tracked.QuietAt is { } quiet && (DateTime.Now - quiet).TotalMilliseconds > QuietDebounceMs)
                     Flush(tracked, endpointName);
             }
+
+            if (active)
+                activeCount++;
         }
+
+        return activeCount;
     }
 
     /// <summary>Фиксирует накопленный всплеск как отдельное событие звука.</summary>
@@ -200,11 +255,43 @@ public sealed class SoundSourceTracker : IDisposable
         if (duration.TotalMilliseconds < 40)
             return;
 
-        var evt = Describe(tracked.Control, endpointName, duration, peak);
+        // Одиночное оповещение: сессия прожила недолго целиком, либо процесс
+        // молчал дольше QuietGapMs, либо сессия активировалась после простоя
+        // (типичный признак «пришло уведомление»).
+        bool shortSession = (DateTime.Now - tracked.FirstSeenAt).TotalMilliseconds <= _shortSoundMaxMs;
+
+        string processKey = $"{endpointName}|{GetProcessId(tracked.Control)}";
+        bool wasQuiet = _lastSoundAt.TryGetValue(processKey, out DateTime last) &&
+                        (DateTime.Now - last).TotalMilliseconds >= _quietGapMs;
+
+        _lastSoundAt[processKey] = DateTime.Now;
+
+        uint pid = GetProcessId(tracked.Control);
+
+        // Процесс, который непрерывно играет на этом выходе (игра, музыка) — не оповещение.
+        bool isDominant = _dominantProcess.TryGetValue(endpointName, out uint dominant) && dominant == pid;
+
+        bool isAlert = (shortSession || wasQuiet || tracked.ActivatedAfterIdle) && !isDominant;
+
+        tracked.ActivatedAfterIdle = false;
+
+        var evt = Describe(tracked.Control, endpointName, duration, peak, isAlert);
         Record(evt);
     }
 
-    private SoundEvent Describe(AudioSessionControl control, string endpointName, TimeSpan duration, double peak)
+    private static uint GetProcessId(AudioSessionControl control)
+    {
+        try
+        {
+            return control.GetProcessID;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private SoundEvent Describe(AudioSessionControl control, string endpointName, TimeSpan duration, double peak, bool isOneShot)
     {
         uint pid = 0;
         string display = string.Empty;
@@ -231,7 +318,8 @@ public sealed class SoundSourceTracker : IDisposable
             (int)pid,
             processName,
             duration,
-            peak);
+            peak,
+            isOneShot);
     }
 
     private static string ResolveProcessName(uint pid, bool systemSounds)

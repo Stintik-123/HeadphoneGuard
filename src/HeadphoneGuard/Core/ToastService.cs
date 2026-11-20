@@ -14,7 +14,7 @@ public sealed class ToastService
     public const string AppId = "HeadphoneGuard.BatteryGuard";
     private const string DisplayName = "HeadphoneGuard";
 
-    [DllImport("ole32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
 
     public bool Initialize()
