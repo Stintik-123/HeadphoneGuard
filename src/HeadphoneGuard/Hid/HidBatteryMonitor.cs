@@ -41,7 +41,7 @@ public sealed class HidBatteryMonitor : IDisposable
                 _names[key] = name;
 
                 var listener = new HidListener(collection.Path, collection.InputReportLength);
-                listener.FrameReceived += frame => OnFrame(key, name, frame);
+                listener.FrameReceived += frame => OnFrame(name, name, frame);
                 listener.Start();
                 _listeners.Add(listener);
 
