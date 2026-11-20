@@ -1,0 +1,48 @@
+name: Bug report
+description: Опишите проблему
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Сначала попробуйте собрать диагностику — обычно она сразу показывает источник:
+        `HeadphoneGuard.exe --diagnose --verbose`
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Что произошло
+      description: Ожидаемое и фактическое поведение
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnose-output
+    attributes:
+      label: Вывод --diagnose
+      render: shell
+      description: Вставьте вывод команды --diagnose (безопасные данные можно стереть)
+
+  - type: input
+    id: headset
+    attributes:
+      label: Гарнитура / устройство
+      placeholder: Например, WH-1000XM4, TWS, AirPods Pro
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Версия Windows
+      placeholder: Windows 11 24H2
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: Какой звук вы хотите заглушить
+      options:
+        - Голосовое оповещение о разряде
+        - Системный звук Windows
+        - Звук приложения (известного)
+        - Другой
+    validations:
+      required: true
