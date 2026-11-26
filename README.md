@@ -247,3 +247,11 @@ without touching the game's audio.
 Limitations: Windows does not expose the actual `.wav` path, so the source is identified at the
 application/DLL-resource level. Devices that never report their battery cannot trigger the
 threshold automatically.
+
+## Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Stintik-123/HeadphoneGuard&type=Date&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Stintik-123/HeadphoneGuard&type=Date" />
+  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Stintik-123/HeadphoneGuard&type=Date" />
+</picture>
